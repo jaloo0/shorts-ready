@@ -1,11 +1,28 @@
 name: AI Shorts Processor
 
 on:
-  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      video_source:
+        description: "Where to get the video"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - url
+      video_url:
+        description: "Direct or Google Drive link (only when source = url)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
 
 jobs:
   process-shorts:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Repository
@@ -26,6 +43,35 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install gdown
+
+      - name: Fetch input video
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ inputs.video_source }}
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          mkdir -p input songs output
+          if [ "$SOURCE" = "url" ]; then
+            if [[ "$VIDEO_URL" == *drive.google.com* ]]; then
+              gdown --fuzzy "$VIDEO_URL" -O input/my_video.mp4
+            else
+              curl -L --fail -o input/my_video.mp4 "$VIDEO_URL"
+            fi
+          else
+            gh release download inputs --repo "$GITHUB_REPOSITORY" \
+              --pattern "my_video.mp4" --dir input --clobber
+          fi
+          echo "Input size:" && ls -lh input/my_video.mp4
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 input/my_video.mp4
+
+      - name: Fetch songs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download inputs --repo "$GITHUB_REPOSITORY" \
+            --pattern "song_*" --dir songs --clobber || echo "No songs in release (using repo songs/ if any)."
+          ls -lh songs || true
 
       - name: Run Shorts Processing Script
         env:
@@ -38,3 +84,5 @@ jobs:
         with:
           name: ai-transcribed-shorts
           path: output/ai_transcribed_shorts.mp4
+          if-no-files-found: error
+          retention-days: 7
