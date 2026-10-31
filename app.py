@@ -1,230 +1,343 @@
-import base64
 import io
+import re
+import time
 import zipfile
+from datetime import datetime, timedelta, timezone
+
 import requests
 import streamlit as st
 
-st.set_page_config(
-    page_title="AI Shorts Processor Dashboard", page_icon="🎬", layout="wide"
-)
+st.set_page_config(page_title="AI Shorts Processor", page_icon="🎬", layout="wide")
 
-st.title("🎬 AI Shorts Processor - Control Panel")
-st.markdown(
-    "Manage your video uploads, trigger GitHub Actions, and download your processed AI shorts."
-)
+API = "https://api.github.com"
+RELEASE_TAG = "inputs"            # release that stores your uploaded video + songs
+ARTIFACT_NAME = "ai-transcribed-shorts"
+VIDEO_ASSET = "my_video.mp4"      # the workflow always reads this name
 
-# ==========================================
-# SIDEBAR: GitHub Credentials & Settings
-# ==========================================
-st.sidebar.header("🔐 GitHub Configuration")
-github_token = st.sidebar.text_input(
-    "GitHub Personal Access Token (PAT)",
-    type="password",
-    help="Needs `repo` or `workflow` permissions.",
-)
-repo_name = st.sidebar.text_input(
-    "Repository (owner/repo)",
-    placeholder="e.g., username/repo-name",
-    help="Your GitHub username and repository name.",
-)
-branch_name = st.sidebar.text_input("Branch", value="main")
-workflow_filename = st.sidebar.text_input(
-    "Workflow Filename", value="shorts_processor.yml"
-)
 
-# Helper headers for GitHub API
-headers = {
-    "Authorization": f"Bearer {github_token}",
+def secret(key, default=""):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+
+# ==========================================================
+# OPTIONAL PASSWORD GATE (set APP_PASSWORD in Streamlit secrets)
+# ==========================================================
+app_pw = secret("APP_PASSWORD")
+if app_pw and not st.session_state.get("authed"):
+    st.title("🔒 AI Shorts Processor")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if pw == app_pw:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
+st.title("🎬 AI Shorts Processor")
+st.caption("Upload from anywhere → run on GitHub Actions → download your Short.")
+
+# ==========================================================
+# SIDEBAR CONFIG (auto-filled from Streamlit secrets if set)
+# ==========================================================
+st.sidebar.header("🔐 GitHub")
+token = st.sidebar.text_input(
+    "Personal Access Token", value=secret("GITHUB_TOKEN"), type="password",
+    help="Fine-grained token with Contents + Actions read/write on your repo.",
+)
+repo = st.sidebar.text_input("Repository (owner/repo)", value=secret("GITHUB_REPO"))
+branch = st.sidebar.text_input("Branch", value=secret("GITHUB_BRANCH", "main"))
+workflow = st.sidebar.text_input("Workflow file", value="shorts_processor.yml")
+
+if not (token and repo):
+    st.info("👈 Enter your GitHub token and repository in the sidebar to begin.")
+    st.stop()
+
+HEADERS = {
+    "Authorization": f"Bearer {token}",
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
 
-def upload_to_github(file_bytes, remote_path, commit_message):
-  """Uploads a file directly to the GitHub repository via Contents API."""
-  if not github_token or not repo_name:
-    return False, "GitHub Token and Repository Name are required."
-
-  url = f"https://api.github.com/repos/{repo_name}/contents/{remote_path}"
-
-  # Check if file already exists to get its SHA (required for updating)
-  response = requests.get(url, headers=headers)
-  sha = None
-  if response.status_code == 200:
-    sha = response.json().get("sha")
-
-  encoded_content = base64.b64encode(file_bytes).decode("utf-8")
-  payload = {
-      "message": commit_message,
-      "content": encoded_content,
-      "branch": branch_name,
-  }
-  if sha:
-    payload["sha"] = sha
-
-  put_response = requests.put(url, headers=headers, json=payload)
-  if put_response.status_code in [201, 200]:
-    return True, "Successfully uploaded to repository!"
-  else:
-    return False, f"Error: {put_response.json().get('message', 'Unknown error')}"
+def gh(method, path, **kw):
+    kw.setdefault("timeout", 60)
+    return requests.request(method, f"{API}/repos/{repo}{path}", headers=HEADERS, **kw)
 
 
-# ==========================================
-# MAIN TABS
-# ==========================================
-tab1, tab2, tab3 = st.tabs(
-    ["📤 Upload Media", "🚀 Run & Monitor", "⬇️ Download Shorts"]
-)
+# ==========================================================
+# RELEASE STORAGE (handles files far bigger than the 100MB repo limit)
+# ==========================================================
+def get_or_create_release():
+    r = gh("GET", f"/releases/tags/{RELEASE_TAG}")
+    if r.status_code == 200:
+        return r.json()
+    if r.status_code == 404:
+        c = gh("POST", "/releases", json={
+            "tag_name": RELEASE_TAG,
+            "target_commitish": branch,
+            "name": "Shorts inputs",
+            "body": "Storage for uploaded source video and songs. Managed by the dashboard.",
+            "draft": False,
+            "prerelease": True,
+        })
+        if c.status_code == 201:
+            return c.json()
+        raise RuntimeError(f"Could not create release: {c.json().get('message', c.text)}")
+    raise RuntimeError(f"Could not read releases: {r.json().get('message', r.text)}")
 
-# --- TAB 1: UPLOAD MEDIA ---
+
+def upload_asset(name, fileobj):
+    rel = get_or_create_release()
+    for a in rel.get("assets", []):          # replace if same name exists
+        if a["name"] == name:
+            gh("DELETE", f"/releases/assets/{a['id']}")
+    upload_url = rel["upload_url"].split("{")[0]
+    fileobj.seek(0)
+    r = requests.post(
+        upload_url,
+        params={"name": name},
+        headers={**HEADERS, "Content-Type": "application/octet-stream"},
+        data=fileobj,
+        timeout=3600,
+    )
+    if r.status_code == 201:
+        return True, "Uploaded."
+    return False, r.json().get("message", r.text)
+
+
+def list_assets():
+    rel = get_or_create_release()
+    return rel.get("assets", [])
+
+
+# ==========================================================
+# WORKFLOW CONTROL
+# ==========================================================
+def dispatch(source, url):
+    t0 = datetime.now(timezone.utc)
+    r = gh("POST", f"/actions/workflows/{workflow}/dispatches", json={
+        "ref": branch,
+        "inputs": {"video_source": source, "video_url": url or ""},
+    })
+    return r, t0
+
+
+def find_new_run(t0, tries=25):
+    for _ in range(tries):
+        r = gh("GET", f"/actions/workflows/{workflow}/runs",
+               params={"event": "workflow_dispatch", "per_page": 5})
+        if r.ok:
+            for run in r.json().get("workflow_runs", []):
+                created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+                if created >= t0 - timedelta(seconds=20):
+                    return run
+        time.sleep(3)
+    return None
+
+
+def latest_run():
+    r = gh("GET", f"/actions/workflows/{workflow}/runs", params={"per_page": 1})
+    if r.ok and r.json().get("workflow_runs"):
+        return r.json()["workflow_runs"][0]
+    return None
+
+
+def step_icon(s):
+    if s["status"] == "completed":
+        return {"success": "✅", "skipped": "⏭️"}.get(s.get("conclusion"), "❌")
+    return {"in_progress": "⏳"}.get(s["status"], "🕒")
+
+
+def monitor(run_id, box, max_seconds=75 * 60):
+    start = time.time()
+    run = {}
+    while time.time() - start < max_seconds:
+        r = gh("GET", f"/actions/runs/{run_id}")
+        if r.ok:
+            run = r.json()
+        lines = []
+        jr = gh("GET", f"/actions/runs/{run_id}/jobs")
+        if jr.ok and jr.json().get("jobs"):
+            for s in jr.json()["jobs"][0].get("steps", []):
+                lines.append(f"{step_icon(s)} {s['name']}")
+        elapsed = int(time.time() - start)
+        box.markdown(
+            f"**Run #{run.get('run_number', '?')}** · status: `{run.get('status', '?')}` "
+            f"· watching for {elapsed // 60}m {elapsed % 60}s\n\n" + "\n\n".join(lines)
+        )
+        if run.get("status") == "completed":
+            return run
+        time.sleep(8)
+    return run
+
+
+def fetch_video(run_id):
+    r = gh("GET", f"/actions/runs/{run_id}/artifacts")
+    if not r.ok:
+        return None
+    arts = [a for a in r.json().get("artifacts", [])
+            if a["name"] == ARTIFACT_NAME and not a["expired"]]
+    if not arts:
+        return None
+    dl = requests.get(arts[0]["archive_download_url"], headers=HEADERS, timeout=900)
+    if dl.status_code != 200:
+        return None
+    z = zipfile.ZipFile(io.BytesIO(dl.content))
+    name = next((n for n in z.namelist() if n.endswith(".mp4")), None)
+    return z.read(name) if name else None
+
+
+def finish(run, box):
+    """Handle a completed run: load video or show the failure."""
+    if run.get("status") != "completed":
+        st.warning("Still running. Click **Watch latest run** to continue watching.")
+        return
+    if run.get("conclusion") == "success":
+        with st.spinner("Fetching your Short..."):
+            video = fetch_video(run["id"])
+        if video:
+            st.session_state["video"] = video
+            st.session_state["video_run"] = run["run_number"]
+            st.success("🎉 Done! Open the **Download Short** tab.")
+            st.balloons()
+        else:
+            st.error("Run succeeded but no artifact was found (it may have expired).")
+    else:
+        st.error(f"Run ended with: `{run.get('conclusion')}`. Check the logs: {run.get('html_url')}")
+
+
+# ==========================================================
+# TABS
+# ==========================================================
+tab1, tab2, tab3 = st.tabs(["📤 Upload", "🚀 Run & Monitor", "⬇️ Download Short"])
+
+# ---------------- UPLOAD ----------------
 with tab1:
-  st.subheader("Upload Source Video or Background Song")
-  st.markdown(
-      "> *Note: Standard GitHub repositories have a 100MB file size limit per"
-      " file via API.*"
-  )
+    st.subheader("Upload your files")
+    st.markdown(
+        "Files are stored in a GitHub **Release** (up to 2 GB each), not in your repo history. "
+        "For files above ~500 MB, use a **link** in the Run tab instead."
+    )
+    kind = st.radio("What are you uploading?", ["🎥 Source video", "🎵 Background song"], horizontal=True)
 
-  upload_type = st.radio(
-      "Select File Type to Upload",
-      ["Source Video (input/my_video.mp4)", "Background Song (songs/)"],
-  )
+    if kind.startswith("🎥"):
+        up = st.file_uploader("Choose a video", type=["mp4", "mov", "mkv", "webm", "m4v"], key="up_video")
+        asset_name = VIDEO_ASSET
+    else:
+        up = st.file_uploader("Choose a song", type=["mp3", "wav"], key="up_song")
+        asset_name = ("song_" + re.sub(r"[^A-Za-z0-9._-]+", "_", up.name)) if up else ""
 
-  uploaded_file = st.file_uploader(
-      "Choose a file", type=["mp4", "mov", "mp3", "wav"]
-  )
+    if up is not None:
+        st.info(f"{up.name} · {up.size / 1048576:.1f} MB")
+        if st.button("⬆️ Upload", type="primary"):
+            with st.spinner("Uploading to GitHub..."):
+                try:
+                    ok, msg = upload_asset(asset_name, up)
+                except Exception as e:
+                    ok, msg = False, str(e)
+            st.success(f"✅ Stored as `{asset_name}`") if ok else st.error(f"❌ {msg}")
 
-  if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
-    file_size_mb = len(file_bytes) / (1024 * 1024)
-    st.info(f"File size: {file_size_mb:.2f} MB")
+    with st.expander("📂 Files currently stored"):
+        if st.button("Refresh list"):
+            try:
+                assets = list_assets()
+                if not assets:
+                    st.write("Nothing stored yet.")
+                for a in assets:
+                    st.write(f"`{a['name']}` — {a['size'] / 1048576:.1f} MB")
+            except Exception as e:
+                st.error(str(e))
 
-    if file_size_mb > 95:
-      st.warning(
-          "⚠️ File is close to or exceeds GitHub's 100MB limit. Consider"
-          " compressing your video."
-      )
-
-    if st.button("🚀 Upload to Repository"):
-      with st.spinner("Uploading file to repository..."):
-        if "Source Video" in upload_type:
-          remote_path = "input/my_video.mp4"
-          msg = "Add source video via Streamlit dashboard"
-        else:
-          remote_path = f"songs/{uploaded_file.name}"
-          msg = f"Add song {uploaded_file.name} via Streamlit dashboard"
-
-        success, message = upload_to_github(file_bytes, remote_path, msg)
-        if success:
-          st.success(f"✅ {message} (`{remote_path}`)")
-        else:
-          st.error(f"❌ {message}")
-
-# --- TAB 2: RUN & MONITOR ---
+# ---------------- RUN ----------------
 with tab2:
-  st.subheader("Trigger GitHub Actions Workflow")
-
-  if st.button("▶️ Start Processing Workflow"):
-    if not github_token or not repo_name:
-      st.error("Please configure your GitHub Token and Repository in the sidebar.")
-    else:
-      url = f"https://api.github.com/repos/{repo_name}/actions/workflows/{workflow_filename}/dispatches"
-      payload = {"ref": branch_name}
-      res = requests.post(url, headers=headers, json=payload)
-
-      if res.status_code == 204:
-        st.success(
-            "🎉 Workflow triggered successfully! Check status below or on"
-            " GitHub."
-        )
-      else:
-        st.error(
-            f"❌ Failed to trigger workflow: {res.json().get('message', res.text)}"
+    st.subheader("Start processing")
+    src_choice = st.radio(
+        "Where is the video?",
+        ["Uploaded file (from Upload tab)", "Link (Google Drive / direct URL)"],
+    )
+    url = ""
+    if src_choice.startswith("Link"):
+        url = st.text_input(
+            "Video link",
+            placeholder="https://drive.google.com/file/d/.../view  or a direct .mp4 link",
+            help="Google Drive files must be shared as 'Anyone with the link'.",
         )
 
-  st.markdown("---")
-  st.subheader("📊 Recent Workflow Runs")
-  if st.button("🔄 Refresh Status"):
-    pass
+    box = st.empty()
 
-  if github_token and repo_name:
-    runs_url = f"https://api.github.com/repos/{repo_name}/actions/runs?per_page=5"
-    runs_res = requests.get(runs_url, headers=headers)
-    if runs_res.status_code == 200:
-      runs = runs_res.json().get("workflow_runs", [])
-      for run in runs:
-        if run["path"].endswith(workflow_filename):
-          status = run["status"]
-          conclusion = run["conclusion"] or "in_progress"
-          created_at = run["created_at"]
-          run_id = run["id"]
+    if st.button("▶️ Start processing", type="primary"):
+        source = "url" if src_choice.startswith("Link") else "release"
+        problem = None
+        if source == "url" and not url.strip():
+            problem = "Paste a video link first."
+        elif source == "release":
+            try:
+                names = [a["name"] for a in list_assets()]
+                if VIDEO_ASSET not in names:
+                    problem = "No uploaded video found. Upload one in the Upload tab first."
+            except Exception as e:
+                problem = str(e)
 
-          color_icon = (
-              "🟢"
-              if conclusion == "success"
-              else ("🔴" if conclusion == "failure" else "🟡")
-          )
-          st.markdown(
-              f"{color_icon} **Run ID:** `{run_id}` | **Status:** `{status}` |"
-              f" **Result:** `{conclusion}` | **Time:** `{created_at}`"
-          )
-    else:
-      st.warning("Could not fetch workflow runs.")
-
-# --- TAB 3: DOWNLOAD OUTPUT ---
-with tab3:
-  st.subheader("Download Generated Shorts")
-  st.markdown(
-      "Fetch the output video artifact from the latest successful GitHub Actions"
-      " run."
-  )
-
-  if st.button("🔍 Check for Available Artifacts"):
-    if not github_token or not repo_name:
-      st.error("Please configure your GitHub Token and Repository in the sidebar.")
-    else:
-      artifacts_url = (
-          f"https://api.github.com/repos/{repo_name}/actions/artifacts"
-      )
-      art_res = requests.get(artifacts_url, headers=headers)
-
-      if art_res.status_code == 200:
-        artifacts = art_res.json().get("artifacts", [])
-        if not artifacts:
-          st.info(
-              "No artifacts found yet. Make sure your workflow has finished and"
-              " uploaded an artifact."
-          )
+        if problem:
+            st.error(problem)
         else:
-          latest_art = artifacts[0]  # Most recent artifact
-          art_name = latest_art["name"]
-          art_size = latest_art["size_in_bytes"] / (1024 * 1024)
-          download_url = latest_art["archive_download_url"]
-          expired = latest_art["expired"]
-
-          st.success(
-              f"Found artifact: **{art_name}** ({art_size:.2f} MB)"
-          )
-
-          if expired:
-            st.warning("⚠️ This artifact has expired.")
-          else:
-            # Download the zip archive directly through Streamlit proxy
-            if st.button("📥 Download Final Short"):
-              with st.spinner("Downloading artifact from GitHub..."):
-                dl_res = requests.get(download_url, headers=headers)
-                if dl_res.status_code == 200:
-                  # GitHub returns a zip file containing the artifact folder/file
-                  z = zipfile.ZipFile(io.BytesIO(dl_res.content))
-                  for filename in z.namelist():
-                    if filename.endswith(".mp4"):
-                      video_data = z.read(filename)
-                      st.download_button(
-                          label="💾 Click here to save `ai_transcribed_shorts.mp4`",
-                          data=video_data,
-                          file_name="ai_transcribed_shorts.mp4",
-                          mime="video/mp4",
-                      )
+            r, t0 = dispatch(source, url.strip())
+            if r.status_code != 204:
+                st.error(f"Could not start workflow: {r.json().get('message', r.text)}")
+            else:
+                with st.spinner("Waiting for GitHub to start the run..."):
+                    run = find_new_run(t0)
+                if not run:
+                    st.error("Workflow was triggered but the run was not found. Check the Actions tab on GitHub.")
                 else:
-                  st.error("Failed to download artifact file.")
-      else:
-        st.error("Could not fetch artifacts from GitHub.")
+                    st.session_state["run_id"] = run["id"]
+                    run = monitor(run["id"], box)
+                    finish(run, box)
+
+    if st.button("👀 Watch latest run"):
+        run = latest_run()
+        if not run:
+            st.info("No runs found.")
+        else:
+            run = monitor(run["id"], box)
+            finish(run, box)
+
+# ---------------- DOWNLOAD ----------------
+with tab3:
+    st.subheader("Your Short")
+
+    if "video" in st.session_state:
+        st.caption(f"From run #{st.session_state.get('video_run', '?')}")
+        st.video(st.session_state["video"])
+        st.download_button(
+            "💾 Save Short", st.session_state["video"],
+            file_name="ai_transcribed_shorts.mp4", mime="video/mp4", type="primary",
+        )
+    else:
+        st.info("No video loaded yet. Finish a run, or load an earlier one below.")
+
+    st.markdown("---")
+    st.markdown("**Load an earlier successful run**")
+    if st.button("🔍 Find recent runs"):
+        r = gh("GET", f"/actions/workflows/{workflow}/runs",
+               params={"per_page": 10, "status": "success"})
+        st.session_state["recent"] = r.json().get("workflow_runs", []) if r.ok else []
+
+    recent = st.session_state.get("recent", [])
+    if recent:
+        labels = [f"Run #{x['run_number']} · {x['created_at'].replace('T', ' ').replace('Z', ' UTC')}"
+                  for x in recent]
+        pick = st.selectbox("Run", range(len(recent)), format_func=lambda i: labels[i])
+        if st.button("📥 Load this run"):
+            with st.spinner("Downloading..."):
+                v = fetch_video(recent[pick]["id"])
+            if v:
+                st.session_state["video"] = v
+                st.session_state["video_run"] = recent[pick]["run_number"]
+                st.rerun()
+            else:
+                st.error("No artifact for that run (expired?).")
