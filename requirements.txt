@@ -1,0 +1,4 @@
+librosa
+soundfile
+google-genai
+numpy
